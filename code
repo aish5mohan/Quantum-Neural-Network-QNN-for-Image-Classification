@@ -1,0 +1,159 @@
+# simple_qnn_qiskit_statevector.py
+# Requirements: pip install qiskit numpy scipy scikit-learn matplotlib
+
+import numpy as np
+import matplotlib.pyplot as plt
+plt.show()
+plt.savefig("user_image.png")
+print("Saved image as user_image.png")
+from qiskit import QuantumCircuit
+from qiskit.quantum_info import Statevector
+from scipy.optimize import minimize
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+
+# -----------------------
+# Tiny synthetic dataset
+# -----------------------
+def make_dataset(n=200, seed=0):
+    rng = np.random.RandomState(seed)
+    X, y = [], []
+    for _ in range(n):
+        label = rng.choice([0, 1])
+        img = rng.normal(0.0, 0.1, (4, 4))
+        if label == 0:
+            img[0:2, 0:2] += rng.uniform(0.8, 1.2)
+        else:
+            img[2:4, 2:4] += rng.uniform(0.8, 1.2)
+        img = np.clip(img, 0.0, 1.0)
+        X.append(img.flatten())
+        y.append(label)
+    return np.array(X, dtype=np.float64), np.array(y, dtype=np.int64)
+
+# build dataset + scale
+X, y = make_dataset(300, seed=1)
+scaler = MinMaxScaler(feature_range=(0.0, np.pi))
+X_scaled = scaler.fit_transform(X)
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_scaled, y, test_size=0.25, random_state=42
+)
+
+# -----------------------
+# Quantum circuit helpers
+# -----------------------
+n_qubits = 4
+
+def build_circuit(feature_angles, theta):
+    qc = QuantumCircuit(n_qubits)
+    for q in range(n_qubits):
+        chunk = feature_angles[q::n_qubits]
+        angle = np.sum(chunk)
+        qc.ry(angle, q)
+
+    for q in range(n_qubits):
+        qc.rx(theta[q], q)
+
+    for q in range(n_qubits - 1):
+        qc.cx(q, q + 1)
+
+    return qc
+
+def state_expectation_z(qc, wire):
+    sv = Statevector.from_instruction(qc)
+    probs = sv.probabilities_dict()
+    total_prob_one = sum(p for bit, p in probs.items() if bit[wire] == '1')
+    return 1.0 - 2.0 * total_prob_one
+
+def circuit_predict_single(x_angle_vec, theta):
+    qc = build_circuit(x_angle_vec, theta)
+    exps = [state_expectation_z(qc, w) for w in range(n_qubits)]
+    return np.array(exps, dtype=np.float64)
+
+# -----------------------
+# Model & loss
+# -----------------------
+n_theta = n_qubits
+n_cl = n_qubits
+
+def unpack_params(params):
+    theta = params[:n_theta]
+    w_cl = params[n_theta:n_theta+n_cl]
+    b = params[-1]
+    return theta, w_cl, b
+
+def model_logits_batch(X_batch, params):
+    theta, w_cl, b = unpack_params(params)
+    logits = []
+    for x in X_batch:
+        logits.append(np.dot(w_cl, circuit_predict_single(x, theta)) + b)
+    return np.array(logits)
+
+def loss_and_grad(params, X_batch, y_batch):
+    logits = model_logits_batch(X_batch, params)
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    eps = 1e-9
+    return -np.mean(y_batch*np.log(probs+eps) + (1-y_batch)*np.log(1-probs+eps))
+
+# -----------------------
+# Training
+# -----------------------
+init_params = np.concatenate([
+    0.01*np.random.randn(n_theta),
+    0.01*np.random.randn(n_cl),
+    [0.0]
+])
+
+X_train_small = X_train[:80]
+y_train_small = y_train[:80]
+
+print("Starting optimization...")
+res = minimize(lambda p: loss_and_grad(p, X_train_small, y_train_small),
+               init_params,
+               method='COBYLA',
+               options={'maxiter': 80, 'disp': True})
+
+trained_params = res.x
+print("Optimization done. Final loss:", res.fun)
+
+# -----------------------
+# Test accuracy
+# -----------------------
+logits_test = model_logits_batch(X_test, trained_params)
+probs_test = 1 / (1 + np.exp(-logits_test))
+preds = (probs_test >= 0.5).astype(int)
+acc = accuracy_score(y_test, preds)
+print(f"Test accuracy: {acc * 100:.2f}%")
+
+# -----------------------
+# USER INPUT
+# -----------------------
+print("\nEnter 16 pixel values (0–1), space separated.")
+user_vals = np.array([float(v) for v in input().split()])
+
+if user_vals.shape[0] != 16:
+    raise ValueError("You must enter exactly 16 values!")
+
+# scale to [0, pi]
+user_scaled = scaler.transform([user_vals])[0]
+
+# prediction
+logit = model_logits_batch([user_scaled], trained_params)[0]
+prob = 1 / (1 + np.exp(-logit))
+pred = 1 if prob >= 0.5 else 0
+
+print(f"Prediction: {pred}, Probability class 1: {prob:.4f}")
+
+# -----------------------
+# SHOW USER INPUT AS 4×4 IMAGE
+# -----------------------
+
+img = np.array(user_vals, dtype=np.float32).reshape(4, 4)
+img_display = (img - np.min(img)) / (np.max(img) - np.min(img) + 1e-9)
+plt.imshow(img_display, cmap='gray')
+plt.title(f"Your 4×4 Image (Predicted class = {pred})")
+plt.colorbar()
+plt.savefig("user_image.png")
+plt.show()
+
